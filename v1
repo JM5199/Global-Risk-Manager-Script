@@ -1,0 +1,950 @@
+// ==UserScript==
+// @name         Trading Risk Enforcer v14 - LIVE
+// @namespace    discipline.lock
+// @version      3.0
+// @description  Full enforced discipline with daily contract, max trades, max loss, 2 micros, post-fill lock, and hotkey lock. Ready for live trading.
+// @match        https://topstepx.com/*
+// @match        https://trader.tradovate.com/*
+// @match        https://tradezella.com/*
+// @match        https://app.tradezella.com/*
+// @grant        GM_setValue
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_xmlhttpRequest
+// @connect      127.0.0.1
+// @connect      localhost
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    /* ==================== TEST MODE CONFIG ==================== */
+    const TEST_MODE_TOPSTEP = false;
+    const TEST_MODE_TRADOVATE = false; // SET TO false FOR LIVE TRADING
+    const TEST_ALLOW_MINIS = false;
+
+
+    /* ==================== CONFIG ==================== */
+    const MAX_TRADES = 6;
+    const MAX_MICROS = 2;
+    const MAX_LOSS = 300;
+    const MAX_WIN = 500;
+    const CHECKIN_INTERVAL_MIN = 25;
+    const POST_FILL_LOCK_MIN = 15;
+    const HOTKEY_LOCK_MIN = 15;
+    const LOCK_HOURS = 2;
+
+    const JOURNAL_URL = "https://app.tradezella.com/tracking";
+
+
+    const DAILY_CONTRACT_TIME = { hour: 9, min: 40 };
+    const TRADE_WINDOW_START = { hour: 9, min: 55 };
+    const TRADE_WINDOW_END = { hour: 12, min: 0 };
+
+    /* ==================== STATE ==================== */
+    // Use NY timezone for date boundary so reset fires at Eastern midnight
+    const nyNow = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+    const todayDate = new Date(nyNow).toDateString();
+    const SESSION_MAX_AGE_MS = 8 * 60 * 60 * 1000; // 8-hour session boundary
+
+    let state = GM_getValue("STATE", {
+        date: todayDate,
+        tradeCount: 0,
+        fillsSinceLock: 0,
+        lastCheckin: Date.now(),
+        lockedUntil: null,
+        totalPnL: 0,
+        dailyContractSigned: false,
+        lastFillStamp: null,
+        seenFillIDs: [],
+        freePasses: 1,
+        lastAutoReset: Date.now()
+    });
+
+    // ONE-TIME FORCE RESET FOR LIVE TRANSITION (Clearing all legacy trades/IDs/Locks)
+    if (!state.liveTransitionComplete) {
+        state.tradeCount = 0;
+        state.fillsSinceLock = 0;
+        state.totalPnL = 0;
+        state.dailyContractSigned = false;
+        state.lockedUntil = null;
+        state.seenFillIDs = [];
+        state.freePasses = 1;
+        state.liveTransitionComplete = true;
+        GM_setValue("STATE", state);
+    }
+
+    // SESSION BOUNDARY: Reset if new NY day OR state is older than 8 hours
+    const stateAge = Date.now() - (state.lastAutoReset || 0);
+    if (state.date !== todayDate || stateAge > SESSION_MAX_AGE_MS) {
+        const resetReason = state.date !== todayDate ? 'New NY day' : 'State >8h old';
+        console.log(`[SESSION RESET] Clearing all state. Reason: ${resetReason}`);
+        updateState({
+            date: todayDate,
+            tradeCount: 0,
+            fillsSinceLock: 0,
+            lastCheckin: Date.now(),
+            lockedUntil: null,
+            totalPnL: 0,
+            dailyContractSigned: false,
+            lastFillStamp: null,
+            seenFillIDs: [],
+            freePasses: 1,
+            lastAutoReset: Date.now(),
+            testModePnlBypass: false,
+            lastCheckinSlot: null
+        });
+    }
+
+    // Backward compatibility: Ensure seenFillIDs exists
+    if (!state.seenFillIDs) {
+        state.seenFillIDs = [];
+        GM_setValue("STATE", state);
+    }
+
+    // Fix: Ensure freePasses is initialized (prevent "null LEFT")
+    if (state.freePasses === null || state.freePasses === undefined) {
+        state.freePasses = 3; // Grant 3 passes for testing/debugging
+        GM_setValue("STATE", state);
+    }
+
+    function save() {
+        GM_setValue("STATE", state);
+    }
+
+    // Atomic state update to prevent race conditions
+    function updateState(patch) {
+        let current = GM_getValue("STATE", state);
+        state = { ...current, ...patch };
+        GM_setValue("STATE", state);
+        return state;
+    }
+
+    /* ==================== DOM HELPER ==================== */
+    function runWhenBodyReady(fn) {
+        if (document.body) {
+            console.log("[DISCIPLINE] Body ready immediately.");
+            fn();
+        } else {
+            console.log("[DISCIPLINE] Waiting for document.body...");
+            const timer = setInterval(() => {
+                if (document.body) {
+                    console.log("[DISCIPLINE] Body found! Initializing...");
+                    clearInterval(timer);
+                    fn();
+                }
+            }, 50); // Fast check
+        }
+    }
+
+    /* ==================== HARD LOCK ==================== */
+    function lock(reason, minutes = 15) {
+        runWhenBodyReady(() => {
+            // NEVER LOCK TRADEZELLA UI - Allow journaling
+            if (location.href.includes("tradezella.com")) return;
+
+            // Only set a NEW lock if we aren't already just rendering an active one
+            // And ONLY if we don't have an active timer already (don't push timer forward)
+            if (reason !== "LOCK ACTIVE" && (!state.lockedUntil || Date.now() >= state.lockedUntil)) {
+                updateState({
+                    lockedUntil: Date.now() + minutes * 60000
+                });
+
+                // --- TRIGGER PYTHON HARD LOCK EXE ---
+                // We use a small timeout to ensure state is saved first
+                setTimeout(() => {
+                    GM_xmlhttpRequest({
+                        method: "POST",
+                        url: "http://127.0.0.1:8765/lock",
+                        headers: { "Content-Type": "application/json" },
+                        data: JSON.stringify({ reason: reason, duration: minutes }),
+                        onload: function (response) {
+                            console.log("[HARD LOCK] Signal sent to EXE:", response.responseText);
+                        },
+                        onerror: function (err) {
+                            console.log("[HARD LOCK] EXE not running or connection failed.", err);
+                        }
+                    });
+                }, 100);
+            }
+
+            // Create or update the overlay
+            let overlay = document.getElementById("discipline-lock-overlay");
+            if (!overlay) {
+                overlay = document.createElement("div");
+                overlay.id = "discipline-lock-overlay";
+                document.body.appendChild(overlay);
+            }
+
+            overlay.style.cssText = `
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100vw;
+                height: 100vh;
+                background: black;
+                color: red;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                z-index: 1000000;
+                text-align: center;
+                font-family: sans-serif;
+            `;
+
+            const unlockTime = new Date(state.lockedUntil).toLocaleTimeString();
+            overlay.innerHTML = `
+                <div style="font-size: 36px; font-weight: bold; margin-bottom: 20px;">🚫 TRADING LOCKED</div>
+                <div style="font-size: 24px; color: white; margin-bottom: 20px;">${reason}</div>
+                <div style="font-size: 18px; color: #888;">Unlocks at ${unlockTime}</div>
+                <div style="margin-top: 40px; display: flex; gap: 10px;">
+                    <button id="lockScreenDebugPassBtn" style="padding: 15px 30px; background: #2196F3; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 18px; font-weight: bold; ${state.freePasses <= 0 ? 'opacity: 0.5; cursor: not-allowed;' : ''}">🐞 USE DEBUG PASS (${state.freePasses} LEFT)</button>
+                </div>
+            `;
+
+            const passBtn = document.getElementById("lockScreenDebugPassBtn");
+            if (passBtn) {
+                passBtn.onclick = () => {
+                    if (state.freePasses <= 0) {
+                        alert("❌ No debug passes remaining for today!");
+                        return;
+                    }
+                    const password = prompt(`🐞 USE DEBUG PASS?\n\nRemaining: ${state.freePasses}\n\nType "DEBUG" to bypass the lock and rules.\n\n(Time locks cleared, trades kept, risk checks paused)`);
+                    if (password && password.trim() === "DEBUG") {
+                        updateState({
+                            freePasses: state.freePasses - 1,
+                            lockedUntil: null,
+                            testModePnlBypass: true
+                        });
+                        location.reload();
+                    } else {
+                        alert("❌ Incorrect password! Debug pass not used.");
+                    }
+                };
+            }
+
+
+        });
+    }
+
+
+    // ONE-TIME: Clear any active locks if we're outside the blockout window
+    // This ensures clean transition to the new 9 PM - 9:55 AM logic
+    if (!state.blockoutWindowTransition) {
+        const ny = getNYTime();
+        const nowMins = ny.hour * 60 + ny.min;
+        const blockoutStart = 21 * 60;
+        const blockoutEnd = 9 * 60 + 55;
+        const inBlockout = nowMins >= blockoutStart || nowMins < blockoutEnd;
+
+        if (!inBlockout && state.lockedUntil) {
+            console.log(`[BLOCKOUT TRANSITION] Clearing old lock - now outside blockout window`);
+            updateState({
+                lockedUntil: null,
+                blockoutWindowTransition: true
+            });
+        } else {
+            state.blockoutWindowTransition = true;
+            save();
+        }
+    }
+
+    // Only re-lock if the lock is fresh (< 8 hours old) — prevents stale prior-day locks
+    if (state.lockedUntil && Date.now() < state.lockedUntil) {
+        const lockSetTime = state.lockedUntil - 15 * 60000; // approximate when lock was created
+        const lockAge = Date.now() - lockSetTime;
+        if (lockAge > SESSION_MAX_AGE_MS) {
+            console.log(`[STALE LOCK] Clearing old lock (age: ${(lockAge / 3600000).toFixed(1)}h)`);
+            updateState({ lockedUntil: null });
+        } else if (!state.testModePnlBypass) {
+            lock("LOCK ACTIVE");
+        }
+    }
+
+
+    /* ==================== NY TIME HELPER ==================== */
+    function getNYTime() {
+        const now = new Date();
+        const nyStr = now.toLocaleString('en-US', { timeZone: 'America/New_York' });
+        const nyDate = new Date(nyStr);
+        return { hour: nyDate.getHours(), min: nyDate.getMinutes(), date: nyDate };
+    }
+
+    /* ==================== TIME WINDOW ==================== */
+    function inTradeWindow() {
+        const ny = getNYTime();
+        const nowMins = ny.hour * 60 + ny.min;
+        const startMins = TRADE_WINDOW_START.hour * 60 + TRADE_WINDOW_START.min;
+        const endMins = TRADE_WINDOW_END.hour * 60 + TRADE_WINDOW_END.min;
+        return nowMins >= startMins && nowMins <= endMins;
+    }
+
+    // Blockout window: 9:00 PM ET → 9:55 AM ET (overnight)
+    // Outside this range (12 PM - 9 PM) = free time, no lock overlay
+    function inBlockoutWindow() {
+        const ny = getNYTime();
+        const nowMins = ny.hour * 60 + ny.min;
+        const blockoutStart = 21 * 60;       // 9:00 PM = 1260 min
+        const blockoutEnd = 9 * 60 + 55;     // 9:55 AM = 595 min
+        // Overnight range: 9 PM to midnight OR midnight to 9:55 AM
+        return nowMins >= blockoutStart || nowMins < blockoutEnd;
+    }
+
+    if (inBlockoutWindow()) {
+        if (!state.testModePnlBypass) {
+            const ny = getNYTime();
+            const timeStr = `${ny.hour}:${String(ny.min).padStart(2, '0')}`;
+            lock(`Trading locked (9:00 PM - 9:55 AM ET)\nCurrent NY Time: ${timeStr}`);
+        }
+    }
+
+    /* ==================== DAILY CONTRACT ==================== */
+    /* ==================== DAILY CONTRACT (ON TRADOVATE) ==================== */
+    // Show contract screen directly on Tradovate to prevent redirect loops
+    // and ensuring local state update works perfectly.
+    if (!location.href.includes("tradezella.com") && !state.dailyContractSigned && !state.testModePnlBypass) {
+        runWhenBodyReady(() => {
+            const overlay = document.createElement("div");
+            overlay.id = "daily-contract-overlay"; // ID for easy removal
+            overlay.style.cssText =
+                "position:fixed;top:0;left:0;width:100%;height:100%;background:black;color:white;z-index:99999;display:flex;align-items:center;justify-content:center;flex-direction:column;text-align:center";
+
+            overlay.innerHTML = `
+            <h1>📜 DAILY TRADING CONTRACT</h1>
+            <p style="font-size:18px;margin:10px;">✅ I will trade only 2 micros (MNQ / MES)</p>
+            <p style="font-size:18px;margin:10px;">✅ Max 6 trades/day, max loss $300</p>
+            <p style="font-size:18px;margin:10px;">✅ Journal every trade immediately</p>
+            <p style="font-size:18px;margin:10px;">✅ Respect all locks and cooldowns</p>
+            <p style="font-size:18px;margin:10px;">✅ Only trade 9:55 AM - 12:00 PM EST</p>
+            <input id="contractInput" placeholder="TYPE: I FOLLOW MY RULES"
+                   style="padding:12px;font-size:18px;margin:20px;width:320px;text-align:center"/>
+            <button id="confirmBtn" disabled
+                    style="padding:14px 30px;font-size:20px;opacity:0.5;background:#4CAF50;color:white;border:none;border-radius:8px;cursor:pointer;">
+                    CONFIRM CONTRACT
+            </button>
+        `;
+            document.body.appendChild(overlay);
+
+            const input = document.getElementById("contractInput");
+            const btn = document.getElementById("confirmBtn");
+
+            input.addEventListener("input", () => {
+                btn.disabled = input.value.trim().toUpperCase() !== "I FOLLOW MY RULES";
+                btn.style.opacity = btn.disabled ? "0.5" : "1";
+            });
+
+            btn.onclick = () => {
+                state.dailyContractSigned = true;
+                save();
+                alert("✅ Daily contract confirmed! Trading unlocked.");
+                document.body.removeChild(overlay);
+                // location.reload(); // Optional but removal is smoother
+            };
+        });
+    }
+
+    function enforceContracts() {
+        // NOTE: We now ALLOW enforcement in test mode so user can verify it works
+        // BUT we must allow the bypass to clear it
+        if (state.testModePnlBypass || TEST_ALLOW_MINIS) {
+            return;
+        }
+
+        // ONLY scan the ORDER ENTRY area, NOT the entire page body
+        // Look for instrument/symbol selectors near order widgets
+        const orderSelectors = [
+            '.instrument-name', '.symbol-name', '.order-ticket',
+            '.contract-selector', '[class*="order"] [class*="symbol"]',
+            '[class*="order"] [class*="instrument"]',
+            '[class*="ticket"] [class*="symbol"]',
+            'select[class*="contract"]', 'input[class*="symbol"]',
+            '.widget-order-ticket', '.order-entry',
+            // Tradovate specific
+            '.order-ticket-contract', '.ot-contract-name'
+        ];
+
+        let foundMini = false;
+        document.querySelectorAll(orderSelectors.join(",")).forEach(el => {
+            const elText = (el.innerText || el.value || "").trim().toUpperCase();
+            // Only flag if we see a STANDALONE NQ or ES (not MNQ or MES)
+            // Must be a clean ticker like "NQ", "NQH6", "ES", "ESZ5" etc.
+            if (/\b(?<!M)(NQ|ES)[A-Z]?\d?\b/.test(elText) && !/\bM(NQ|ES)/.test(elText)) {
+                foundMini = true;
+                console.log(`[CONTRACT CHECK] Mini detected in order widget: "${elText}"`);
+            }
+        });
+
+        if (foundMini) {
+            lock("🚫 MINI CONTRACT DETECTED (NQ/ES) - Only micros allowed!");
+            return;
+        }
+
+        // Quantity enforcement (keep this — it only checks input elements)
+        const qtySelectors = [
+            "input[type='number']",
+            "input[aria-label*='quantity'i]",
+            "input[aria-label*='qty'i]",
+            "input[placeholder*='qty'i]",
+            "input[placeholder*='quantity'i]",
+            ".qty-input input",
+            "input.quantity"
+        ];
+
+        document.querySelectorAll(qtySelectors.join(",")).forEach(input => {
+            const val = parseInt(input.value);
+            if (!isNaN(val) && val > MAX_MICROS) {
+                const isQty = input.getAttribute('aria-label')?.toLowerCase()?.includes('qty') ||
+                    input.getAttribute('aria-label')?.toLowerCase()?.includes('quantity') ||
+                    input.placeholder?.toLowerCase()?.includes('qty') ||
+                    input.placeholder?.toLowerCase()?.includes('quantity') ||
+                    input.parentElement?.innerText?.toLowerCase()?.includes('qty') ||
+                    input.parentElement?.innerText?.toLowerCase()?.includes('quantity') ||
+                    input.className?.toLowerCase()?.includes('qty') ||
+                    input.className?.toLowerCase()?.includes('quantity');
+
+                if (isQty || input.getAttribute('type') === 'number') {
+                    input.value = MAX_MICROS;
+
+                    if (!window._sizeAlertActive) {
+                        window._sizeAlertActive = true;
+                        alert(`🚫 MAX SIZE: Only ${MAX_MICROS} micros allowed!`);
+                        setTimeout(() => {
+                            window._sizeAlertActive = false;
+                        }, 3000);
+                    }
+                }
+            }
+        });
+    }
+    setInterval(enforceContracts, 2000);
+
+    /* ==================== 9:55 AM ALIGNED CHECK-IN ==================== */
+    setInterval(() => {
+        const now = new Date();
+        const start = new Date(now);
+        start.setHours(9, 55, 0, 0);
+
+        // Only run check-in logic AFTER 9:55 AM
+        if (now >= start) {
+            const elapsedMins = (now - start) / 60000;
+            const currentSlot = Math.floor(elapsedMins / 25);
+
+            // Initialize slot if missing (first run)
+            if (state.lastCheckinSlot === undefined || state.lastCheckinSlot === null) {
+                state.lastCheckinSlot = currentSlot;
+                save();
+            } else if (currentSlot > state.lastCheckinSlot) {
+                // New 25-min slot entered
+                state.lastCheckinSlot = currentSlot;
+                save();
+                alert("📝 25-MIN CHECK-IN REQUIRED - Redirecting to TradeZella");
+                location.href = JOURNAL_URL;
+            }
+        }
+    }, 10000); // Check every 10s
+
+    /* ==================== PNL CHECK ==================== */
+    function detectPnL() {
+        let detectedPnL = null;
+
+        const text = document.body.innerText;
+
+        // Strategy 1: Look for parenthetical number (ALWAYS a loss)
+        let match = text.match(/\(\s*\$?(\d[\d,]*\.?\d*)\s*\)/);
+        if (match) {
+            detectedPnL = -1 * parseFloat(match[1].replace(/,/g, ''));
+            window._lastMatchRaw = `(${match[1]}) = LOSS`;
+        } else {
+            // Strategy 2: Look for negative sign
+            match = text.match(/-\s*\$?(\d[\d,]*\.?\d*)/);
+            if (match) {
+                detectedPnL = -1 * parseFloat(match[1].replace(/,/g, ''));
+                window._lastMatchRaw = `-${match[1]} = LOSS`;
+            } else {
+                // Strategy 3: Look for positive number near P&L keywords
+                match = text.match(/(p&l|pnl|profit|loss)[\s\S]{0,50}?\$?(\d[\d,]*\.?\d*)/i);
+                if (match) {
+                    detectedPnL = parseFloat(match[2].replace(/,/g, ''));
+                    window._lastMatchRaw = `${match[2]} = PROFIT`;
+                } else {
+                    window._lastMatchRaw = "NO MATCH";
+                }
+            }
+        }
+
+        if (detectedPnL !== null && !isNaN(detectedPnL)) {
+            updateState({ totalPnL: detectedPnL });
+
+            if (state.totalPnL <= -MAX_LOSS) {
+                if (state.testModePnlBypass) {
+                    console.log("DEBUG: P&L Limit hit but Bypassed via Debug Reset");
+                } else {
+                    lock(`💸 MAX DAILY LOSS HIT (-$${Math.abs(state.totalPnL).toFixed(2)})`);
+                }
+            } else if (state.totalPnL >= MAX_WIN) {
+                if (state.testModePnlBypass) {
+                    console.log("DEBUG: Max Win Limit hit but Bypassed via Debug Reset");
+                } else {
+                    lock(`💰 MAX DAILY PROFIT HIT (+$${state.totalPnL.toFixed(2)}) - LOCKING PROFITS`);
+                }
+            }
+        }
+    }
+    setInterval(detectPnL, 2000); // Faster scan in test mode
+
+    /* ==================== FILL DETECTION ==================== */
+    let seenFillMessages = new Set(); // Fallback text-deduplication for the current session
+    window._scannerLogs = []; // Global diagnostic buffer
+    window._lastScanHasOrders = false; // Sync check
+    let trapCooldown = 0; // Strategy 3 cooldown
+
+    // Strategy 3: Ultimate Fallback - Trap Console Logs
+    const originalLog = console.log;
+    const originalInfo = console.info;
+    const hook = (original, args) => {
+        original.apply(console, args);
+        const msg = Array.from(args).join(" "); // FIX: Convert arguments to real array
+        // Trap Console Logs for Market Actions
+        if (msg.includes("User Action:") && (msg.includes("BuyMarket") || msg.includes("SellMarket"))) {
+            // Explicitly ignore ANY log that looks like a Limit, Stop, or Cancel action
+            if (msg.match(/stop|limit|cancel/i)) return;
+            const now = Date.now();
+            // REDUCED cooldown from 5s to 2s to catch rapid orders
+            if (now - trapCooldown > 2000) {
+                trapCooldown = now;
+                window._lastTrap = msg.substring(0, 150); // Capture more context
+
+                // Extract a pseudo-ID from the message (timestamp + action type)
+                const direction = msg.includes("BuyMarket") ? "BUY" : "SELL";
+                const timestamp = msg.match(/(\d{2}:\d{2}:\d{2}\.\d{3}Z)/)?.[1] || Date.now();
+                const symbol = msg.match(/FUNCHARTS\s+(\w+)/)?.[1] || "UNKNOWN";
+                const pseudoID = `${direction}_${symbol}_${timestamp}`;
+
+                originalLog.call(console, `[TRAP DETECTED] ${direction} on ${symbol} at ${timestamp} | Pseudo-ID: ${pseudoID}`);
+
+                // We use a small delay so it doesn't conflict with any immediate UI state changes
+                setTimeout(() => processFill(`LOG_TRAP: ${direction} ${symbol}`, pseudoID), 500);
+            }
+        }
+    };
+    console.log = function () { hook(originalLog, arguments); };
+    console.info = function () { hook(originalInfo, arguments); };
+
+    function processFill(sourceText = "AUTO-DETECT", orderID = null, ignoreCount = false) {
+        // CRITICAL DIAGNOSTIC: Log every call to processFill
+        console.log(`[PROCESSFILL CALLED] Source: ${sourceText} | OrderID: ${orderID} | Current Trade Count: ${state.tradeCount}`);
+
+        // Use state-based ID tracking for persistence across reloads
+        if (orderID) {
+            // Handle both numeric IDs and pseudo-IDs (strings)
+            const idString = String(orderID);
+            if (state.seenFillIDs.includes(idString)) {
+                console.log(`[FILL DUPLICATE] Already saw ID: ${idString}`);
+                return;
+            }
+
+            // If ignoreCount is true (First Scan + Zero Count), track but don't count
+            if (ignoreCount) {
+                updateState({
+                    seenFillIDs: [...state.seenFillIDs, idString].slice(-100)
+                });
+                console.log(`[IGNORE HISTORY] Added existing ID: ${idString} to seen list without counting.`);
+                return;
+            }
+
+            updateState({
+                seenFillIDs: [...state.seenFillIDs, idString].slice(-100)
+            });
+            console.log(`[FILL TRACKED] New ID: ${idString} | Source: ${sourceText}`);
+        } else if (ignoreCount) {
+            // If no ID but ignoreCount is true (text match without ID on first scan), just return
+            console.log(`[IGNORE HISTORY] Ignoring text match: ${sourceText}`);
+            return;
+        }
+
+        const stamp = Date.now();
+        // REDUCED global cooldown from 4s to 2s to catch rapid trades
+        if (!orderID && state.lastFillStamp && stamp - state.lastFillStamp < 2000) {
+            console.log(`[FILL COOLDOWN] Skipping - too soon after last fill (${stamp - state.lastFillStamp}ms)`);
+            return;
+        }
+
+        // CRITICAL: Enforce strict time window - lock out if order placed outside trading hours
+        // CRITICAL: Enforce strict time window - lock out if order placed outside trading hours
+        // REMOVED TEST_MODE bypass to enforce time window in all modes
+        const ny = getNYTime();
+        const nowMins = ny.hour * 60 + ny.min;
+        const startMins = TRADE_WINDOW_START.hour * 60 + TRADE_WINDOW_START.min;
+        const endMins = TRADE_WINDOW_END.hour * 60 + TRADE_WINDOW_END.min;
+
+        if (nowMins < startMins || nowMins > endMins) {
+            const timeStr = `${ny.hour}:${String(ny.min).padStart(2, '0')}`;
+            console.log(`[TIME VIOLATION] Order detected outside trading window at ${timeStr} NY`);
+            lock(`🚫 ORDER OUTSIDE TRADING WINDOW\n\nOrder placed at ${timeStr} ET\nAllowed: 9:55 AM - 12:00 PM ET\n\nYou are locked for violating the time window.`);
+            return;
+        }
+
+        updateState({
+            lastFillStamp: stamp,
+            tradeCount: state.tradeCount + 1,
+            fillsSinceLock: state.fillsSinceLock + 1
+        });
+
+        window._lastFillReason = orderID ? `ID:${orderID}` : sourceText;
+
+        console.log(`[FILL PROCESSED] Trade #${state.tradeCount} | Fills Since Lock: ${state.fillsSinceLock} | Reason: ${window._lastFillReason}`);
+
+        alert(`📝 TRADE FILLED (${state.tradeCount}/${MAX_TRADES})\nMatch: ${window._lastFillReason}\nJournal now!`);
+
+        // Check max trades FIRST
+        // Check max trades FIRST
+        if (state.tradeCount >= MAX_TRADES) {
+            lock(`🚫 MAX TRADES HIT (${MAX_TRADES}) - DAY OVER`);
+            return;
+        }
+
+        // Logic: Redirect on every 2nd fill (2, 4, 6...). Lock ONLY on 4th fill (limit).
+        // Logic: Redirect/Lock ONLY on 4th fill (allow 4-order sequence for scaling)
+        if (!location.href.includes("tradezella.com")) {
+            const isFourthFill = state.fillsSinceLock >= 4;
+
+            if (isFourthFill) {
+                // 4th fill - Lock AND Redirect
+                state.fillsSinceLock = 0;
+                save();
+                lock(`🚫 4 FILLS TAKEN - ${POST_FILL_LOCK_MIN} MIN COOLDOWN`, POST_FILL_LOCK_MIN);
+                alert(`🛑 4 FILLS COMPLETED - Auto-Lock for ${POST_FILL_LOCK_MIN} mins!\n\nRedirecting to journal...`);
+                setTimeout(() => {
+                    window.location.href = JOURNAL_URL;
+                }, 1000);
+            }
+            // 1st, 2nd, 3rd fills - continue without interruption
+        }
+    }
+
+    // HISTORY SCAN: Ignore existing trades for the first 10 scan cycles (5 seconds)
+    // This prevents old "order filled" text and table rows from being counted as new trades
+    const FIRST_SCAN_CYCLES = 10; // 10 cycles x 500ms = 5 seconds of grace period
+    let firstScanCount = 0;
+
+    function scanForFill() {
+        // strictIgnore = true for the first 10 scans when tradeCount is 0
+        const inHistoryScan = firstScanCount < FIRST_SCAN_CYCLES && state.tradeCount === 0;
+
+        // 1. SCAN ORDERS TAB AND GRID ROWS (Comprehensive SPA support)
+        const selectors = 'tr, [role="row"], .grid-row, .order-row, .row, .public_fixedDataTableRow_main';
+        const rows = document.querySelectorAll(selectors);
+
+        let currentScanLogs = [];
+        let orderModuleFound = false;
+        let rowsScanned = 0;
+
+        rows.forEach(row => {
+            const rowText = (row.innerText || row.textContent || "").trim();
+            if (!rowText || rowText.length < 5) return;
+
+            rowsScanned++;
+
+            const lowerText = rowText.toLowerCase();
+
+            // Heuristic: Are we in the Orders module?
+            if (lowerText.includes("avg fill price") || lowerText.includes("order id")) {
+                orderModuleFound = true;
+            }
+
+            // Check for "filled" or "exec" or "complete"
+            const hasFillStatus = /filled|exec|complete/i.test(lowerText);
+
+            // Numerical ID detection (6-14 digits)
+            const idMatch = rowText.match(/(\d{6,14})/);
+
+            // Only count as a fill if it has BOTH a fill status AND an ID
+            // This prevents watch list symbols from being counted as trades
+            if (hasFillStatus && idMatch) {
+                currentScanLogs.push(`[MATCH] ID:${idMatch[1]} | TEXT: ${rowText.substring(0, 80)}`);
+                console.log(`[SCANNER] Found filled order - ID: ${idMatch[1]} | Row: ${rowText.substring(0, 60)}`);
+                processFill(rowText.substring(0, 40), idMatch[1], inHistoryScan);
+            }
+        });
+
+        window._lastScanHasOrders = orderModuleFound;
+
+        // Log scanner activity every 10 seconds
+        if (!window._lastScanLog || Date.now() - window._lastScanLog > 10000) {
+            window._lastScanLog = Date.now();
+            console.log(`[SCANNER STATUS] Rows: ${rowsScanned} | Orders: ${orderModuleFound} | Matches: ${currentScanLogs.length} | HistoryScan: ${inHistoryScan} (${firstScanCount}/${FIRST_SCAN_CYCLES})`);
+        }
+
+        // Update global logs (keep last 10)
+        if (currentScanLogs.length > 0) {
+            window._scannerLogs = [...currentScanLogs, ...window._scannerLogs].slice(0, 10);
+        }
+
+        // Increment scan counter
+        if (firstScanCount < FIRST_SCAN_CYCLES) {
+            firstScanCount++;
+            if (firstScanCount === FIRST_SCAN_CYCLES && state.tradeCount === 0) {
+                console.log("[HISTORY SCAN COMPLETE] 5-second grace period finished. Future fills will count as real trades.");
+            }
+        }
+
+        // 2. SCAN POPUPS/GLOBAL TEXT (Fallback)
+        const text = document.body.innerText;
+        const fillKeywords = [
+            /order filled/i, /filled order/i, /fill status/i, /executed/i,
+            /bought\s+\d+\s+@/i, /sold\s+\d+\s+@/i, /fill size/i,
+            /order status[:\s]*filled/i, /working[:\s]*filled/i,
+            /confirmed[:\s]*filled/i, /order\s+complete/i,
+            /trade\s+executed/i, /position\s+opened/i, /entry\s+filled/i
+        ];
+
+        for (const regex of fillKeywords) {
+            const match = text.match(regex);
+            if (match) {
+                const matchText = match[0].toLowerCase();
+
+                // Try to find a nearby ID (check 200 chars around)
+                const start = Math.max(0, match.index - 50);
+                const end = Math.min(text.length, match.index + 150);
+                const context = text.substring(start, end);
+                const idMatch = context.match(/(\d{6,14})/);
+
+                if (idMatch) {
+                    console.log(`[SCANNER] Found fill keyword: ${matchText} with ID: ${idMatch[1]}`);
+                    processFill(matchText, idMatch[1], inHistoryScan);
+                } else {
+                    if (!seenFillMessages.has(matchText)) {
+                        seenFillMessages.add(matchText);
+                        setTimeout(() => seenFillMessages.delete(matchText), 15000);
+                        console.log(`[SCANNER] Found fill keyword without ID: ${matchText}`);
+                        processFill(matchText, null, inHistoryScan);
+                    }
+                }
+                // Continue loop to catch other potential concurrent popups
+            }
+        }
+    }
+
+    setInterval(scanForFill, 500);
+
+    /* ==================== DEBUG BUTTONS FOR TRADOVATE ==================== */
+    if (TEST_MODE_TRADOVATE && location.href.includes("tradovate.com")) {
+        const container = document.createElement("div");
+        container.style.cssText = "position:fixed;bottom:20px;right:20px;display:flex;flex-direction:column;gap:10px;z-index:99999;";
+
+        const btnReset = document.createElement("button");
+        btnReset.textContent = "🔓 UNLOCK & RESET ALL";
+        btnReset.style.cssText = "padding:15px;font-size:18px;background:#555;color:white;border:none;border-radius:8px;cursor:pointer;box-shadow:0 4px 8px rgba(0,0,0,0.3);";
+        btnReset.onclick = () => {
+            state = {
+                date: todayDate,
+                tradeCount: 0,
+                fillsSinceLock: 0,
+                lastCheckin: Date.now(),
+                lockedUntil: null,
+                totalPnL: 0,
+                dailyContractSigned: true,
+                lastFillStamp: null,
+                seenFillIDs: []
+            };
+            save();
+            location.reload();
+        };
+
+        container.appendChild(btnReset);
+        document.body.appendChild(container);
+    }
+
+    /* ==================== HOTKEY LOCK (==) ==================== */
+    let buffer = [];
+    document.addEventListener("keydown", e => {
+        buffer.push({ k: e.key, t: Date.now() });
+        if (buffer.length > 2) buffer.shift();
+        if (buffer.length === 2 &&
+            buffer[0].k === "=" &&
+            buffer[1].k === "=" &&
+            buffer[1].t - buffer[0].t < 1200) {
+            lock(`✋ EMERGENCY HOTKEY LOCK (${HOTKEY_LOCK_MIN} min)`, HOTKEY_LOCK_MIN);
+        }
+    });
+
+    /* ==================== STATUS DISPLAY ==================== */
+    function createStatusDisplay() {
+        const statusDiv = document.createElement("div");
+        statusDiv.id = "discipline-status";
+        statusDiv.style.cssText = "position:fixed;bottom:10px;left:10px;background:rgba(0,0,0,0.9);color:#0f0;padding:15px;border-radius:8px;font-family:monospace;font-size:14px;z-index:99999999;min-width:280px;border:2px solid #0f0;";
+
+        function updateStatus() {
+            // Session reset is now handled at boot (8h boundary + NY date check)
+            // No mid-session auto-reset needed — prevents unexpected reloads
+
+            // Check-in Timer (Aligned to 9:55 AM)
+            const now = new Date();
+            const startCheckin = new Date(now);
+            startCheckin.setHours(9, 55, 0, 0);
+
+            let checkinMsg = "";
+            if (now < startCheckin) {
+                const diffMins = Math.ceil((startCheckin - now) / 60000);
+                checkinMsg = `${diffMins}m (Wait 9:55 AM)`;
+            } else {
+                const elapsed = (now - startCheckin) / 60000;
+                const minsIntoSlot = elapsed % 25;
+                const minsLeft = Math.ceil(25 - minsIntoSlot);
+                checkinMsg = `${minsLeft} min`;
+            }
+
+            statusDiv.innerHTML = `
+                <div style="color:#00ff00;font-weight:bold;margin-bottom:10px;font-size:16px;">🛡️ RISK MONITOR</div>
+                <div style="margin:5px 0;">Trades: ${state.tradeCount}/${MAX_TRADES}</div>
+                <div style="font-size:10px;color:#666;margin:-3px 0 5px 0;">(Source: ${window._lastFillReason || 'NONE'})</div>
+                <div style="font-size:10px;color:#444;margin:-3px 0 5px 0;">(Log Match: ${window._lastTrap || '...'})</div>
+                <div style="margin:5px 0;">Fills Since Lock: ${state.fillsSinceLock}/4</div> <!-- UPDATE 2->4 -->
+                <div style="margin:5px 0;">P&L: <span id="pnl-val" style="color:${state.totalPnL >= 0 ? '#0f0' : '#f00'};font-weight:bold;">$${state.totalPnL.toFixed(2)}</span></div>
+                <div style="font-size:10px;color:#666;margin:-3px 0 5px 0;">(Scanner saw: ${window._lastMatchRaw || '...'})</div>
+                <div style="margin:5px 0;">Max Loss: -$${MAX_LOSS} ${state.testModePnlBypass ? '<span style="color:#ff0">(BYPASSED)</span>' : ''}</div>
+                <div style="margin:5px 0;">Max Win: +$${MAX_WIN}</div>
+                <div style="font-size:10px;color:#888;margin-top:5px;display:flex;align-items:center;gap:5px;">
+                    <div id="scan-dot" style="width:6px;height:6px;background:#0f0;border-radius:50%;opacity:0;"></div>
+                    <span>Orders Synced: ${window._lastScanHasOrders ? '<span style="color:#0f0">YES</span>' : '<span style="color:#f00">NO (Click Orders Tab)</span>'}</span>
+                </div>
+                <div style="margin:5px 0;">Next Check-in: ${checkinMsg}</div>
+                <div style="margin:5px 0;">Contract: ${state.dailyContractSigned ? '✅' : '❌'}</div>
+                ${TEST_ALLOW_MINIS ? '<div style="color:#ff0;font-size:11px;">⚠️ MINIS ALLOWED (TEST)</div>' : ''}
+                ${state.testModePnlBypass ? '<button id="enableRulesBtn" style="margin-top:10px;width:100%;padding:8px;background:#4CAF50;color:white;border:none;border-radius:4px;cursor:pointer;font-weight:bold;">🛡️ RE-ENABLE ALL RULES</button>' : ''}
+                <div style="display:flex;gap:5px;margin-top:10px;">
+                    <button id="dumpLogsBtn" style="flex:1;padding:6px;background:#555;color:white;border:none;border-radius:4px;cursor:pointer;font-size:10px;">LOG SCANNER</button>
+                    <button id="copyTextBtn" style="flex:1;padding:6px;background:#555;color:white;border:none;border-radius:4px;cursor:pointer;font-size:10px;">COPY PAGE TEXT</button>
+                </div>
+                <div style="display:flex;gap:5px;margin-top:5px;">
+                    <button id="clearIDsBtn" style="flex:1;padding:6px;background:#f44336;color:white;border:none;border-radius:4px;cursor:pointer;font-size:10px;">RESET TRADES & IDs (${state.seenFillIDs?.length || 0})</button>
+                    <button id="showIDsBtn" style="flex:1;padding:6px;background:#555;color:white;border:none;border-radius:4px;cursor:pointer;font-size:10px;">SHOW IDs</button>
+                </div>
+
+                <button id="debugPassBtn" style="margin-top:5px;width:100%;padding:6px;background:#2196F3;color:white;border:none;border-radius:4px;cursor:pointer;font-size:10px;font-weight:bold;${state.freePasses <= 0 ? 'opacity:0.5;cursor:not-allowed;' : ''}">🐞 USE DEBUG PASS (${state.freePasses} LEFT)</button>
+                <div style="margin-top:10px;color:#ffff00;font-size:12px;">Press == for emergency lock</div>
+                ${TEST_MODE_TRADOVATE ? '<div style="margin-top:8px;color:#ff5722;font-weight:bold;">🧪 TEST MODE ACTIVE</div>' : ''}
+            `;
+            // Pulse the scanning dot
+            const dot = document.getElementById("scan-dot");
+            if (dot) {
+                dot.style.opacity = dot.style.opacity === "1" ? "0.2" : "1";
+            }
+
+            // Sync local state with storage in case detectPnL updated it
+            state = GM_getValue("STATE", state);
+
+            const enableBtn = document.getElementById("enableRulesBtn");
+            if (enableBtn) {
+                enableBtn.onclick = () => {
+                    updateState({ testModePnlBypass: false });
+                    location.reload();
+                };
+            }
+
+            const dumpBtn = document.getElementById("dumpLogsBtn");
+            if (dumpBtn) {
+                dumpBtn.onclick = () => {
+                    console.log("--- SCANNER LOG DUMP ---");
+                    console.table(window._scannerLogs);
+                    alert("Scanner logs dumped to console (F12)!");
+                };
+            }
+
+            const copyBtn = document.getElementById("copyTextBtn");
+            if (copyBtn) {
+                copyBtn.onclick = () => {
+                    const dump = document.body.innerText;
+                    navigator.clipboard.writeText(dump);
+                    alert("PAGE TEXT COPIED! Paste into the chat.");
+                };
+            }
+
+            const clearIDsBtn = document.getElementById("clearIDsBtn");
+            if (clearIDsBtn) {
+                clearIDsBtn.onclick = () => {
+                    if (confirm(`RESET TRADES & IDs?\n\nThis will clear:\n- Trade Count (${state.tradeCount})\n- Seen IDs (${state.seenFillIDs?.length || 0})\n\n(Time locks and PnL will be PRESERVED for discipline)`)) {
+                        updateState({
+                            tradeCount: 0,
+                            fillsSinceLock: 0,
+                            lastFillStamp: null,
+                            seenFillIDs: []
+                        });
+                        alert("✅ Trade count reset! Page will reload.\n\nNote: Active time-locks remain until they expire.");
+                        location.reload();
+                    }
+                };
+            }
+
+            const showIDsBtn = document.getElementById("showIDsBtn");
+            if (showIDsBtn) {
+                showIDsBtn.onclick = () => {
+                    console.log("--- TRACKED ORDER IDs ---");
+                    console.log(`Total IDs tracked: ${state.seenFillIDs.length}`);
+                    console.table(state.seenFillIDs);
+                    alert(`${state.seenFillIDs.length} order IDs logged to console (F12)`);
+                };
+            }
+
+
+
+            const debugPassBtn = document.getElementById("debugPassBtn");
+            if (debugPassBtn) {
+                debugPassBtn.onclick = () => {
+                    if (state.freePasses <= 0) {
+                        alert("❌ No debug passes remaining for today!");
+                        return;
+                    }
+                    const password = prompt(`🐞 USE DEBUG PASS?\n\nRemaining: ${state.freePasses}\n\nType "DEBUG" to bypass the lock and rules.\n\n(Time locks cleared, trades kept, risk checks paused)`);
+                    if (password && password.trim() === "DEBUG") {
+                        updateState({
+                            freePasses: state.freePasses - 1,
+                            lockedUntil: null,
+                            testModePnlBypass: true
+                        });
+                        alert(`✅ Pass used! ${state.freePasses} remaining. Reloading...`);
+                        location.reload();
+                    } else {
+                        alert("❌ Incorrect password! Debug pass not used.");
+                    }
+                };
+            }
+        }
+
+        updateStatus();
+        setInterval(updateStatus, 1000); // Update UI faster (1s)
+        document.body.appendChild(statusDiv);
+
+        // PERSISTENCE WATCHDOG: Re-append if Tradovate/React wipes it
+        setInterval(() => {
+            if (document.body) {
+                if (!document.body.contains(statusDiv)) {
+                    console.warn("[UI WATCHDOG] Element missing! Re-appending Discipline Monitor...");
+                    document.body.appendChild(statusDiv);
+                }
+                // Ensure visibility (in case hidden by styles)
+                if (statusDiv.style.display === "none") {
+                    statusDiv.style.display = "block";
+                }
+            } else {
+                console.warn("[UI WATCHDOG] document.body is NULL!");
+            }
+        }, 1000);
+    }
+
+    function forceInit() {
+        if (location.href.includes("tradezella.com")) return;
+
+        // Only initialize if the dashboard doesn't already exist in the DOM
+        if (!document.getElementById("discipline-status")) {
+            console.log("[DISCIPLINE] Dashboard missing or initializing...");
+            createStatusDisplay();
+        }
+    }
+
+    // Multi-phase initialization to catch SPA shell loading and hydration
+    runWhenBodyReady(forceInit);
+    [1000, 2500, 5000].forEach(delay => setTimeout(forceInit, delay));
+
+})();
