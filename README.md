@@ -116,3 +116,42 @@ The script is actively maintained to ensure compatibility with the supported pla
 If you encounter issues or need new features, feel free to raise issues in the GitHub repository or fork the script for personal modifications.
 
 Please ensure you're only using this script for personal use and within the bounds of your trading platform's terms of service.
+
+# Hard Lock Script - Trading Discipline Enforcement
+*For users wanting an OS lockout feature when the web risk rules trigger must build and debug to your custom lockout rules
+
+
+## Overview
+
+The **Hard Lock Script** is a Python-based application designed to help traders enforce discipline by blocking access to trading websites and applications during critical trading periods. The script locks your system, preventing any user input (mouse or keyboard) for a specified duration and blocks access to trading websites via the **hosts** file and **Windows Firewall** rules.
+
+This script is intended to help traders avoid impulsive decisions by enforcing a temporary lockout and blocking access to specific sites.
+
+---
+
+## Features
+
+### 1. **Hard Lock Functionality**
+   - **Input Block**: Locks both mouse and keyboard inputs for a configurable time period (default: 1 minute).
+   - **Website Blocking**: Blocks access to trading websites (e.g., Tradovate, Topstep) using **Windows Firewall** and **hosts** file.
+   - **Hotkey Trigger**: Press `==` (double equal signs) on your keyboard to trigger the lock, which will prevent further input.
+
+### 2. **IP Resolution and Blocking**
+   - Resolves the IPs of blocked websites using DNS or Google DNS fallback.
+   - Adds these IPs to the **Windows Firewall** and **hosts** file to block access to the sites.
+   - Automatically updates blocked IPs as they change.
+
+### 3. **Flask Server Integration**
+   - Exposes a local HTTP API endpoint (`/lock`) to trigger the lock remotely via external tools or systems.
+
+---
+
+## Installation
+
+### 1. **Install Python 3.10+**
+   - Ensure you have Python version **3.10 or higher** installed. You can download it from the [official Python website](https://www.python.org/downloads/).
+
+### 2. **Install Required Python Libraries**
+   - Install the necessary dependencies using `pip`:
+   ```bash
+   pip install flask psutil pynput pyinstaller
