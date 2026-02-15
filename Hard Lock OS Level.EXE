@@ -1,0 +1,591 @@
+# ==========================================
+# HARD LOCK SCRIPT - BUILD INSTRUCTIONS
+# ==========================================
+# 1. Install Python 3.10+
+# 2. Install requirements:
+#    pip install flask psutil pynput pyinstaller
+# 3. Build EXE (Run this in D:\0trades\Scripts):
+#    pyinstaller --noconsole --onefile hard_lock.py
+# 4. Run dist/hard_lock.exe as Administrator
+# ==========================================
+
+import threading
+import time
+import os
+import psutil
+from pynput import mouse, keyboard
+import tkinter as tk
+from flask import Flask, request
+import json
+import shutil
+import subprocess
+import socket
+import ctypes
+import sys
+import re
+
+# ================= ADMIN CHECK =================
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+# ================= LOGGING =================
+log_lock = threading.Lock()
+
+def log_debug(msg):
+    try:
+        with log_lock:
+            with open("lock_debug.log", "a") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except: pass
+    print(msg) # Also print to console
+
+# ================= URL BLOCKING (HOSTS + FIREWALL + NETWORK) =================
+HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
+REDIRECT_IP = "127.0.0.1"
+BLOCK_URLS = [
+    "trader.tradovate.com", 
+    "tradovate.com", 
+    "topstepx.com", 
+    "topstep.com",
+    "app.topstep.com",
+    "trader.topstep.com",
+    "www.tradovate.com",
+    "www.topstepx.com",
+    "www.topstep.com",
+    "login.tradovate.com",
+    "login.topstep.com",
+    "demo.tradovate.com",
+    "live.tradovate.com"
+]
+
+# Hardcoded Fallback IPs (User Provided & Known)
+FALLBACK_IPS = {
+    "35.186.238.68", # Tradovate (User provided)
+    "104.18.26.216", # Topstep (Cloudflare)
+    "104.18.27.216", # Topstep (Cloudflare)
+}
+
+FIREWALL_RULE_NAME = "TradeLock_Block"
+BLOCKED_IPS = set(FALLBACK_IPS) # Start with fallbacks known
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lock_state.json")
+
+# Set socket timeout to prevent long hangs on resolution
+socket.setdefaulttimeout(2.0)
+
+def get_real_ip_addresses(domain):
+    """Resolve domain to REAL IP addresses. Tries standard DNS first, falls back to nslookup 8.8.8.8 if blocked."""
+    ips = set()
+    
+    # Method 1: Fast Standard DNS
+    try:
+        # socket.getaddrinfo is FAST (ms)
+        results = socket.getaddrinfo(domain, None)
+        for info in results:
+            ip = info[4][0]
+            if ip != "127.0.0.1" and not ip.startswith("127."):
+                 ips.add(ip)
+    except: pass
+    
+    # If we got results (and they aren't localhost), return fast
+    if ips:
+        return list(ips)
+
+    # Method 2: Fallback to Google DNS (Slow but bypasses HOSTS)
+    try:
+        cmd = f"nslookup {domain} 8.8.8.8"
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo)
+        found = re.findall(r"Address:\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", result.stdout)
+        for ip in found:
+            if not ip.startswith("8.8.8") and not ip.startswith("127."): 
+                ips.add(ip)
+    except Exception as e:
+        pass
+        
+    return list(ips)
+
+def refresh_ips_thread():
+    """Background thread to refresh IPs without blocking main loop"""
+    global BLOCKED_IPS
+    new_ips = set(FALLBACK_IPS) # Always include fallbacks
+    
+    # log_debug("[NETWORK] Resolving IPs in background...")
+    for url in BLOCK_URLS:
+        ips = get_real_ip_addresses(url)
+        for ip in ips:
+            new_ips.add(ip)
+    
+    BLOCKED_IPS = new_ips
+    # log_debug(f"[NETWORK] Resolved {len(BLOCKED_IPS)} unique IPs (including fallbacks).")
+    save_state_ips()
+
+def start_ip_refresh():
+    """Start IP refresh in a NON-BLOCKING thread"""
+    threading.Thread(target=refresh_ips_thread, daemon=True).start()
+
+def check_firewall_rule_exists():
+    """Check if our specific firewall rule exists"""
+    cmd = f'netsh advfirewall firewall show rule name="{FIREWALL_RULE_NAME}"'
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo)
+        return "No rules match" not in result.stdout
+    except:
+        return False
+
+def add_firewall_rules():
+    """Block access to specific IPs via Windows Firewall"""
+    if not BLOCKED_IPS:
+        return
+
+    # Check if rule exists first to avoid THRASHING
+    if check_firewall_rule_exists():
+        return
+
+    # Create a comma-separated list of IPs
+    ip_list = ",".join(list(BLOCKED_IPS))
+    
+    # Command to add outbound block rule
+    cmd = f'netsh advfirewall firewall add rule name="{FIREWALL_RULE_NAME}" dir=out action=block remoteip={ip_list} profile=any'
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    subprocess.run(cmd, capture_output=True, startupinfo=startupinfo)
+    log_debug(f"[FIREWALL] Block rule verified/created.")
+
+def remove_firewall_rules():
+    """Remove the Windows Firewall block rule"""
+    cmd = f'netsh advfirewall firewall delete rule name="{FIREWALL_RULE_NAME}"'
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    subprocess.run(cmd, capture_output=True, startupinfo=startupinfo)
+    log_debug("[FIREWALL] Rules removed.")
+
+def update_hosts_file(block_active):
+    try:
+        if not is_admin():
+            log_debug("[HOSTS] SKIPPING - ADMIN PRIVILEGES REQUIRED")
+            return
+
+        # Start background refresh if blocking, but don't wait for it
+        if block_active:
+             start_ip_refresh()
+
+        # 1. Read existing lines
+        with open(HOSTS_PATH, "r") as f:
+            lines = f.readlines()
+        
+        # 2. Filter out current blocked lines
+        new_lines = [line for line in lines if not any(url in line for url in BLOCK_URLS)]
+        
+        # 3. Add new blocked lines if active
+        if block_active:
+            for url in BLOCK_URLS:
+                new_lines.append(f"{REDIRECT_IP} {url}\n")
+        
+        # 4. Write back if changed
+        if "".join(new_lines) != "".join(lines):
+            try:
+                os.chmod(HOSTS_PATH, 0o666)
+            except: pass
+            
+            with open(HOSTS_PATH, "w") as f:
+                f.writelines(new_lines)
+            
+            # 5. FLUSH DNS - CRITICAL for changes to work immediately
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            subprocess.run(["ipconfig", "/flushdns"], capture_output=True, startupinfo=startupinfo)
+            log_debug(f"[HOSTS] Network block {'ENABLED' if block_active else 'DISABLED'} (DNS Flushed)")
+
+        # 6. MANAGE FIREWALL RULES
+        if block_active:
+            # Add rules immediately with current known IPs (Fallbacks + Cached)
+            add_firewall_rules() 
+        else:
+            remove_firewall_rules()
+            
+    except Exception as e:
+        error_msg = f"Network Block Error: {e}\nPLEASE RUN AS ADMINISTRATOR"
+        log_debug(f"[HOSTS] {error_msg}")
+
+# ================= FLASK SERVER =================
+app = Flask(__name__)
+
+# ================= PERSISTENCE =================
+def save_state_ips():
+    """Save detected IPs to JSON so we remember them across restarts"""
+    try:
+        if os.path.exists(STATE_FILE):
+             with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+        else:
+            data = {}
+        
+        data["blocked_ips"] = list(BLOCKED_IPS)
+        with open(STATE_FILE, "w") as f:
+            json.dump(data, f)
+    except: pass
+
+def save_state(block_end_time):
+    try:
+        # Load existing first to preserve specific fields
+        if os.path.exists(STATE_FILE):
+             with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+        else:
+            data = {}
+
+        data["network_block_end_time"] = block_end_time
+        data["date"] = time.strftime("%Y-%m-%d")  # Tag with today's date
+        
+        with open(STATE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        log_debug(f"Error saving state: {e}")
+
+def load_state():
+    global BLOCKED_IPS, network_block_end_time
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+
+                # DATE GUARD: Discard stale state from prior days
+                saved_date = data.get("date", "")
+                today = time.strftime("%Y-%m-%d")
+                if saved_date != today:
+                    log_debug(f"[STATE] Stale state from {saved_date}, clearing for new day {today}.")
+                    network_block_end_time = 0
+                    save_state(0)
+                    return 0
+                
+                # Load IPs
+                saved_ips = data.get("blocked_ips", [])
+                if saved_ips:
+                    for ip in saved_ips:
+                        BLOCKED_IPS.add(ip)
+
+                # Load network block expiration time
+                network_block_end_time = data.get("network_block_end_time", 0)
+                return network_block_end_time
+    except Exception as e:
+        log_debug(f"Error loading state: {e}")
+    return 0
+
+# ================= HARD LOCK STATE =================
+is_locked = False
+lock_reason = ""
+emergency_unlock = False
+
+# Network block persistence
+network_block_end_time = 0  # Unix timestamp when network block should end
+NETWORK_BLOCK_DURATION = 4 * 60  # 4 minutes in seconds (TESTING)
+
+# Controllers for mouse and keyboard
+mouse_controller = mouse.Controller()
+keyboard_controller = keyboard.Controller()
+
+# ================= GUI =================
+root = tk.Tk()
+root.title("Trading Hard Lock EXE")
+root.geometry("350x250") # Height increased for new label
+root.resizable(False, False)
+
+# Stay on top
+root.attributes("-topmost", True)
+
+if not is_admin():
+    status_label = tk.Label(root, text="⚠️ NOT ADMIN ⚠️\nBLOCKING WILL FAIL", font=("Helvetica", 16, "bold"), fg="red")
+else:
+    status_label = tk.Label(root, text="Status: Unlocked", font=("Helvetica", 12), fg="green")
+status_label.pack(pady=10)
+
+network_status_label = tk.Label(root, text="Network Block: INACTIVE", font=("Helvetica", 10, "bold"), fg="gray")
+network_status_label.pack()
+
+reason_label = tk.Label(root, text="", font=("Helvetica", 10), wraplength=300)
+reason_label.pack(pady=5)
+
+def manual_lock():
+    if not is_locked:
+        threading.Thread(target=block_input, args=(1 * 60, "MANUAL GUI LOCK (1 MIN TEST)"), daemon=True).start()
+
+btn_lock = tk.Button(root, text="🔒 TRIGGER 1 MIN TEST LOCK", command=manual_lock, font=("Helvetica", 10, "bold"), bg="#f44336", fg="white", pady=5)
+btn_lock.pack(pady=5)
+
+hotkey_label = tk.Label(root, text="Hotkey: Press == to lock | Unlock: IMPOSSIBLE", font=("Helvetica", 9), fg="gray")
+hotkey_label.pack(side="bottom", pady=10)
+
+# Load network block state and apply if still active
+load_state()
+if network_block_end_time > time.time():
+    log_debug(f"[STARTUP] Existing network block active until {time.strftime('%H:%M:%S', time.localtime(network_block_end_time))}")
+    update_hosts_file(True)
+else:
+    # Clean slate if no active block
+    update_hosts_file(False)
+
+def update_gui(status, reason=""):
+    try:
+        if not is_admin():
+            status_label.config(text="⚠️ NOT ADMIN ⚠️\nRESTART AS ADMIN", fg="red")
+        else:
+            color = "red" if "Locked" in status else "green"
+            status_label.config(text=f"Status: {status}", fg=color)
+        
+        reason_label.config(text=reason)
+        
+        # Update network block status
+        if network_block_end_time > time.time():
+            remaining = network_block_end_time - time.time()
+            hours = remaining / 3600
+            network_status_label.config(
+                text=f"Network Block: ACTIVE ({hours:.1f}h remaining)\nSites blocked until {time.strftime('%I:%M %p', time.localtime(network_block_end_time))}", 
+                fg="red"
+            )
+        else:
+            network_status_label.config(text="Network Block: INACTIVE", fg="gray")
+    except: pass
+
+# Initial GUI refresh
+root.after(100, lambda: update_gui("Unlocked" if not is_locked else "Locked"))
+
+# ================= PROCESS KILLER HELPER =================
+def kill_browsers_and_trading_apps():
+    """Aggressively kill browsers and trading apps to force fresh connections"""
+    # Expanded list of target processes
+    targets = ['chrome', 'msedge', 'tradovate', 'brave', 'firefox', 'topstep', 'quantower', 'opera']
+    count = 0
+    for proc in psutil.process_iter(['name']):
+        try:
+            pname = (proc.info['name'] or '').lower()
+            if any(t in pname for t in targets):
+                try:
+                    proc.kill()
+                    count += 1
+                except: pass
+        except: pass
+    log_debug(f"[KILLER] Terminated {count} browser/trading processes.")
+
+# Track system-wide hotkeys (== to lock)
+global_buffer = []
+
+def on_press(key):
+    global global_buffer
+    if is_locked:
+        return True # Suppress input when locked
+    
+    try:
+        k = key.char if hasattr(key, 'char') else str(key)
+        if k == "=":
+            now = time.time()
+            global_buffer.append(now)
+            if len(global_buffer) > 2:
+                global_buffer.pop(0)
+            
+            if len(global_buffer) == 2 and (global_buffer[1] - global_buffer[0] < 1.2):
+                log_debug("[HOTKEY] System-wide == detected. Triggering lock.")
+                threading.Thread(target=block_input, args=(1 * 60, "SYSTEM-WIDE HOTKEY LOCK (==) 1MIN TEST"), daemon=True).start()
+                global_buffer = []
+        else:
+            global_buffer = []
+    except:
+        pass
+    return True
+
+def on_move(x, y): return True 
+def on_click(x, y, button, pressed): return True
+def on_scroll(x, y, dx, dy): return True 
+
+# ================= HARD LOCK FUNCTION =================
+def block_input(duration_sec, reason_text):
+    global is_locked, emergency_unlock, key_sequence, network_block_end_time
+    is_locked = True
+    emergency_unlock = False
+    key_sequence = []
+    
+    # Set network block to expire after NETWORK_BLOCK_DURATION
+    network_block_end_time = time.time() + NETWORK_BLOCK_DURATION
+    save_state(network_block_end_time)
+    log_debug(f"[NETWORK BLOCK] Will expire in {NETWORK_BLOCK_DURATION // 60} min at {time.strftime('%H:%M:%S', time.localtime(network_block_end_time))}")
+    
+    # 1. IMMEDIATE GUI & INPUT FREEZE (Zero Latency)
+    root.after(0, lambda: update_gui("Locked", reason_text))
+    log_debug(f"[HARD LOCK] {reason_text} | Duration: {duration_sec} sec")
+
+    # Start pynput listeners FIRST (suppress=True blocks input immediately)
+    k_listener = keyboard.Listener(on_press=on_press, suppress=True)
+    m_listener = mouse.Listener(on_move=on_move, on_click=on_click, on_scroll=on_scroll, suppress=True)
+    k_listener.start()
+    m_listener.start()
+    
+    # 2. FIREWALL & HOSTS (Background Thread to avoid LAG)
+    # This prevents the 10-50s "hang" while waiting for file writes or net commands
+    # But the INPUT is already frozen, so user can't do anything anyway.
+    def activate_network_block():
+        time.sleep(0.5) # Slight delay to let UI refresh
+        kill_browsers_and_trading_apps() # Kill first
+        update_hosts_file(True) # Then block
+    
+    threading.Thread(target=activate_network_block, daemon=True).start()
+
+    try:
+        start = time.time()
+        while time.time() - start < duration_sec:
+            elapsed = time.time() - start
+            remaining = int(duration_sec - elapsed)
+            # Format as mm:ss
+            mins, secs = divmod(remaining, 60)
+            time_str = f"{mins:02d}:{secs:02d}"
+            
+            # Update GUI with countdown from MAIN THREAD (via after) to be safe
+            root.after(0, lambda t=time_str: update_gui(f"Locked ({t})", reason_text))
+            
+            if emergency_unlock:
+                log_debug("[HARD LOCK] Break loop due to emergency unlock")
+                break
+            time.sleep(0.5)
+    finally:
+        k_listener.stop()
+        m_listener.stop()
+        log_debug("[HARD LOCK] Input listeners stopped")
+        
+        # FINAL SAFETY: Kill browsers again on exit/unlock 
+        kill_browsers_and_trading_apps()
+        
+        # Network block stays active - don't clean up yet!
+        remaining_min = max(0, (network_block_end_time - time.time()) / 60)
+        log_debug(f"[PERSISTENCE] Network block remains active for {remaining_min:.0f} more min")
+
+    is_locked = False
+    remaining_min = max(0, (network_block_end_time - time.time()) / 60)
+    new_message = f"Input unlocked. Sites blocked for {remaining_min:.0f} more min."
+    root.after(0, lambda: update_gui("Unlocked", "EMERGENCY UNLOCK" if emergency_unlock else new_message))
+    log_debug(f"[HARD LOCK] Input freeze over. Network block persists for {remaining_min:.0f} more min.")
+
+# ================= FLASK ENDPOINT =================
+@app.route("/lock", methods=["POST"])
+def lock_endpoint():
+    global is_locked
+    if is_locked:
+        return {"status": "already_locked"}, 200
+
+    data = request.json
+    reason = data.get("reason", "MAX LOSS OR MAX TRADES")
+    duration_mins = data.get("duration", 1) # Default to 1 minute (TESTING)
+    duration_sec = duration_mins * 60
+
+    log_debug(f"[LOCK TRIGGERED] Reason: {reason} | Duration: {duration_mins}m ({duration_sec}s)")
+    threading.Thread(target=block_input, args=(duration_sec, reason), daemon=True).start()
+    return {"status": "locked", "duration_sec": duration_sec, "reason": reason}, 200
+
+# ================= RUN FLASK =================
+def run_flask():
+    log_debug("[INFO] Hard Lock EXE Server running on http://127.0.0.1:8765")
+    try:
+        app.run(host="127.0.0.1", port=8765, debug=False, use_reloader=False)
+    except Exception as e:
+        log_debug(f"[FLASK ERROR] {e}")
+
+# ================= BACKGROUND MONITOR =================
+def background_process_killer():
+    global network_block_end_time, BLOCKED_IPS
+    targets = ['tradovate', 'topstep', 'topstepx', 'trader.tradovate', 'tickerstube', 'quantower']
+    
+    import ctypes
+    EnumWindows = ctypes.windll.user32.EnumWindows
+    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
+    GetWindowText = ctypes.windll.user32.GetWindowTextW
+    GetWindowTextLength = ctypes.windll.user32.GetWindowTextLengthW
+    IsWindowVisible = ctypes.windll.user32.IsWindowVisible
+
+    def check_window(hwnd, lParam):
+        if IsWindowVisible(hwnd):
+            length = GetWindowTextLength(hwnd)
+            if length > 0:
+                buff = ctypes.create_unicode_buffer(length + 1)
+                GetWindowText(hwnd, buff, length + 1)
+                title = buff.value.lower()
+                if any(t in title for t in targets):
+                    import ctypes.wintypes
+                    pid = ctypes.wintypes.DWORD()
+                    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    try:
+                        p = psutil.Process(pid.value)
+                        p_name = p.name().lower()
+                        if p_name not in ['explorer.exe', 'taskmgr.exe']:
+                            p.kill()
+                            log_debug(f"[MONITOR] Killed window process: {title} ({p_name})")
+                    except:
+                        pass
+        return True
+
+    # Initial IP Resolve (Non-blocking)
+    start_ip_refresh()
+    
+    last_cleanup_check = 0
+    
+    while True:
+        try:
+            # Check if network block has expired (every 5 seconds for responsive cleanup)
+            if time.time() - last_cleanup_check > 5:
+                last_cleanup_check = time.time()
+                if network_block_end_time > 0 and time.time() > network_block_end_time:
+                    log_debug("[MONITOR] Network block EXPIRED. Removing hosts + firewall NOW.")
+                    update_hosts_file(False)
+                    network_block_end_time = 0
+                    save_state(0)
+                    log_debug("[MONITOR] Cleanup COMPLETE. Sites should be accessible.")
+            
+            # Only run process monitoring when lock is ACTIVE
+            if is_locked:
+                # Kill trading windows/processes only during active lock
+                for proc in psutil.process_iter(['name', 'cmdline']):
+                    try:
+                        pname = (proc.info['name'] or '').lower()
+                        if any(t in pname for t in targets):
+                            proc.kill()
+                            continue
+                        if pname in ['chrome.exe', 'msedge.exe', 'brave.exe', 'firefox.exe', 'opera.exe']:
+                             cmdline = (proc.info.get('cmdline') or [])
+                             cmdline_str = " ".join(cmdline).lower()
+                             if any(url in cmdline_str for url in BLOCK_URLS):
+                                 proc.kill()
+
+                    except Exception:
+                        pass
+                
+                # Kill by window title (catches browser tabs/PWAs)
+                EnumWindows(EnumWindowsProc(check_window), 0)
+                
+        except Exception as e:
+            pass
+            
+        time.sleep(0.5) # Check every 500ms
+
+# ================= START GUI + SERVER =================
+if not is_admin():
+    ctypes.windll.user32.MessageBoxW(0, "Please restart this program as Administrator for lock features to work.", "Administrative Privileges Required", 0x30)
+
+threading.Thread(target=background_process_killer, daemon=True).start()
+threading.Thread(target=run_flask, daemon=True).start()
+
+# Main system listener for the hotkey (runs always)
+main_k_listener = keyboard.Listener(on_press=on_press)
+main_k_listener.start()
+
+update_gui("Unlocked", "Waiting for lock trigger...")
+
+# Periodic GUI refresh (every second) to update network block countdown
+def periodic_gui_update():
+    update_gui("Unlocked" if not is_locked else "Locked")
+    root.after(1000, periodic_gui_update)
+
+root.after(1000, periodic_gui_update)
+
+root.mainloop()
