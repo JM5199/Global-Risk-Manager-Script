@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Trading Risk Enforcer v14 - LIVE
+// @name         Trading Discipline Enforcer v14 - LIVE
 // @namespace    discipline.lock
 // @version      3.0
 // @description  Full enforced discipline with daily contract, max trades, max loss, 2 micros, post-fill lock, and hotkey lock. Ready for live trading.
@@ -14,6 +14,26 @@
 // @connect      127.0.0.1
 // @connect      localhost
 // ==/UserScript==
+
+/* --- IMMEDIATE BLACKOUT CHECK --- */
+(function () {
+    // We check storage IMMEDIATELY before React/JS loads
+    const rawState = localStorage.getItem('STATE');
+    if (rawState) {
+        try {
+            const parsed = JSON.parse(rawState);
+            const nyNow = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+            const todayDate = new Date(nyNow).toDateString();
+
+            // If locked and not stale, hide the entire page immediately
+            if (parsed.lockedUntil && Date.now() < parsed.lockedUntil && parsed.date === todayDate) {
+                document.documentElement.style.backgroundColor = 'black';
+                document.documentElement.style.display = 'none';
+                console.log("[CRITICAL] LOCK DETECTED - Hiding page immediately.");
+            }
+        } catch (e) { }
+    }
+})();
 
 (function () {
     'use strict';
@@ -30,8 +50,8 @@
     const MAX_LOSS = 300;
     const MAX_WIN = 500;
     const CHECKIN_INTERVAL_MIN = 25;
-    const POST_FILL_LOCK_MIN = 15;
-    const HOTKEY_LOCK_MIN = 15;
+    const POST_FILL_LOCK_MIN = 30;
+    const HOTKEY_LOCK_MIN = 30;
     const LOCK_HOURS = 2;
 
     const JOURNAL_URL = "https://app.tradezella.com/tracking";
@@ -57,7 +77,6 @@
         dailyContractSigned: false,
         lastFillStamp: null,
         seenFillIDs: [],
-        freePasses: 1,
         lastAutoReset: Date.now()
     });
 
@@ -69,7 +88,6 @@
         state.dailyContractSigned = false;
         state.lockedUntil = null;
         state.seenFillIDs = [];
-        state.freePasses = 1;
         state.liveTransitionComplete = true;
         GM_setValue("STATE", state);
     }
@@ -89,9 +107,7 @@
             dailyContractSigned: false,
             lastFillStamp: null,
             seenFillIDs: [],
-            freePasses: 1,
             lastAutoReset: Date.now(),
-            testModePnlBypass: false,
             lastCheckinSlot: null
         });
     }
@@ -102,11 +118,7 @@
         GM_setValue("STATE", state);
     }
 
-    // Fix: Ensure freePasses is initialized (prevent "null LEFT")
-    if (state.freePasses === null || state.freePasses === undefined) {
-        state.freePasses = 3; // Grant 3 passes for testing/debugging
-        GM_setValue("STATE", state);
-    }
+
 
     function save() {
         GM_setValue("STATE", state);
@@ -138,35 +150,42 @@
     }
 
     /* ==================== HARD LOCK ==================== */
-    function lock(reason, minutes = 15) {
+    function lock(reason, minutes = 30) {
         runWhenBodyReady(() => {
             // NEVER LOCK TRADEZELLA UI - Allow journaling
             if (location.href.includes("tradezella.com")) return;
 
-            // Only set a NEW lock if we aren't already just rendering an active one
-            // And ONLY if we don't have an active timer already (don't push timer forward)
-            if (reason !== "LOCK ACTIVE" && (!state.lockedUntil || Date.now() >= state.lockedUntil)) {
+            // Calculate remaining time
+            const remainingMins = Math.max(1, Math.ceil((state.lockedUntil - Date.now()) / 60000));
+
+            // Logic:
+            // 1. If this is a BRAND NEW lock (reason !== "LOCK ACTIVE"), set the state and ping EXE.
+            // 2. If this is a RE-LOAD of an active lock (reason === "LOCK ACTIVE"), just RE-PING EXE to ensure it's running.
+
+            if (reason !== "LOCK ACTIVE") {
                 updateState({
                     lockedUntil: Date.now() + minutes * 60000
                 });
-
-                // --- TRIGGER PYTHON HARD LOCK EXE ---
-                // We use a small timeout to ensure state is saved first
-                setTimeout(() => {
-                    GM_xmlhttpRequest({
-                        method: "POST",
-                        url: "http://127.0.0.1:8765/lock",
-                        headers: { "Content-Type": "application/json" },
-                        data: JSON.stringify({ reason: reason, duration: minutes }),
-                        onload: function (response) {
-                            console.log("[HARD LOCK] Signal sent to EXE:", response.responseText);
-                        },
-                        onerror: function (err) {
-                            console.log("[HARD LOCK] EXE not running or connection failed.", err);
-                        }
-                    });
-                }, 100);
             }
+
+            // Always ping the EXE if we are locked, to ensure the system-level block is active
+            // (Even on refresh, this ensures you can't just kill the EXE and refresh to get out)
+            const durationToSend = (reason === "LOCK ACTIVE") ? remainingMins : minutes;
+
+            setTimeout(() => {
+                GM_xmlhttpRequest({
+                    method: "POST",
+                    url: "http://127.0.0.1:8765/lock",
+                    headers: { "Content-Type": "application/json" },
+                    data: JSON.stringify({ reason: reason, duration: durationToSend }),
+                    onload: function (response) {
+                        console.log("[HARD LOCK] Signal sent to EXE:", response.responseText);
+                    },
+                    onerror: function (err) {
+                        console.log("[HARD LOCK] EXE not running or connection failed.", err);
+                    }
+                });
+            }, 100);
 
             // Create or update the overlay
             let overlay = document.getElementById("discipline-lock-overlay");
@@ -198,35 +217,53 @@
                 <div style="font-size: 36px; font-weight: bold; margin-bottom: 20px;">🚫 TRADING LOCKED</div>
                 <div style="font-size: 24px; color: white; margin-bottom: 20px;">${reason}</div>
                 <div style="font-size: 18px; color: #888;">Unlocks at ${unlockTime}</div>
-                <div style="margin-top: 40px; display: flex; gap: 10px;">
-                    <button id="lockScreenDebugPassBtn" style="padding: 15px 30px; background: #2196F3; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 18px; font-weight: bold; ${state.freePasses <= 0 ? 'opacity: 0.5; cursor: not-allowed;' : ''}">🐞 USE DEBUG PASS (${state.freePasses} LEFT)</button>
-                </div>
+                <div style="margin-top: 40px; font-size: 14px; color: #444;">Persistence Watchdog: ACTIVE</div>
             `;
 
-            const passBtn = document.getElementById("lockScreenDebugPassBtn");
-            if (passBtn) {
-                passBtn.onclick = () => {
-                    if (state.freePasses <= 0) {
-                        alert("❌ No debug passes remaining for today!");
-                        return;
-                    }
-                    const password = prompt(`🐞 USE DEBUG PASS?\n\nRemaining: ${state.freePasses}\n\nType "DEBUG" to bypass the lock and rules.\n\n(Time locks cleared, trades kept, risk checks paused)`);
-                    if (password && password.trim() === "DEBUG") {
-                        updateState({
-                            freePasses: state.freePasses - 1,
-                            lockedUntil: null,
-                            testModePnlBypass: true
-                        });
-                        location.reload();
-                    } else {
-                        alert("❌ Incorrect password! Debug pass not used.");
-                    }
-                };
-            }
-
-
+            // Restore page visibility (we display the overlay instead)
+            document.documentElement.style.display = 'block';
+            document.documentElement.style.backgroundColor = 'black';
         });
     }
+
+    // --- LOCK PERSISTENCE WATCHDOG ---
+    setInterval(() => {
+        if (state.lockedUntil && Date.now() < state.lockedUntil) {
+            // Ensure overlay exists
+            const overlay = document.getElementById("discipline-lock-overlay");
+            if (!overlay) {
+                console.warn("[WATCHDOG] Overlay missing! Re-locking...");
+                lock("LOCK ACTIVE");
+            } else if (overlay.style.display === 'none' || overlay.style.visibility === 'hidden') {
+                overlay.style.display = 'flex';
+                overlay.style.visibility = 'visible';
+            }
+
+            // Block interaction with anything else
+            if (document.body && document.body.style.overflow !== 'hidden') {
+                document.body.style.overflow = 'hidden';
+            }
+
+            // Prevent some refresh attempts
+            if (!window.onbeforeunload) {
+                window.onbeforeunload = function () {
+                    return "Trading is locked. Are you sure you want to refresh?";
+                };
+            }
+        } else {
+            window.onbeforeunload = null;
+        }
+    }, 500);
+
+    // Watch for DOM deletions
+    const observer = new MutationObserver((mutations) => {
+        if (state.lockedUntil && Date.now() < state.lockedUntil) {
+            if (!document.getElementById("discipline-lock-overlay")) {
+                lock("LOCK ACTIVE");
+            }
+        }
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
 
 
     // ONE-TIME: Clear any active locks if we're outside the blockout window
@@ -257,7 +294,7 @@
         if (lockAge > SESSION_MAX_AGE_MS) {
             console.log(`[STALE LOCK] Clearing old lock (age: ${(lockAge / 3600000).toFixed(1)}h)`);
             updateState({ lockedUntil: null });
-        } else if (!state.testModePnlBypass) {
+        } else {
             lock("LOCK ACTIVE");
         }
     }
@@ -292,18 +329,16 @@
     }
 
     if (inBlockoutWindow()) {
-        if (!state.testModePnlBypass) {
-            const ny = getNYTime();
-            const timeStr = `${ny.hour}:${String(ny.min).padStart(2, '0')}`;
-            lock(`Trading locked (9:00 PM - 9:55 AM ET)\nCurrent NY Time: ${timeStr}`);
-        }
+        const ny = getNYTime();
+        const timeStr = `${ny.hour}:${String(ny.min).padStart(2, '0')}`;
+        lock(`Trading locked (9:00 PM - 9:55 AM ET)\nCurrent NY Time: ${timeStr}`);
     }
 
     /* ==================== DAILY CONTRACT ==================== */
     /* ==================== DAILY CONTRACT (ON TRADOVATE) ==================== */
     // Show contract screen directly on Tradovate to prevent redirect loops
     // and ensuring local state update works perfectly.
-    if (!location.href.includes("tradezella.com") && !state.dailyContractSigned && !state.testModePnlBypass) {
+    if (!location.href.includes("tradezella.com") && !state.dailyContractSigned) {
         runWhenBodyReady(() => {
             const overlay = document.createElement("div");
             overlay.id = "daily-contract-overlay"; // ID for easy removal
@@ -347,7 +382,7 @@
     function enforceContracts() {
         // NOTE: We now ALLOW enforcement in test mode so user can verify it works
         // BUT we must allow the bypass to clear it
-        if (state.testModePnlBypass || TEST_ALLOW_MINIS) {
+        if (TEST_ALLOW_MINIS) {
             return;
         }
 
@@ -403,13 +438,20 @@
                     input.className?.toLowerCase()?.includes('qty') ||
                     input.className?.toLowerCase()?.includes('quantity');
 
-                if (isQty || input.getAttribute('type') === 'number') {
+                if (isQty) {
                     input.value = MAX_MICROS;
 
                     if (!window._sizeAlertActive) {
                         window._sizeAlertActive = true;
-                        alert(`🚫 MAX SIZE: Only ${MAX_MICROS} micros allowed!`);
+
+                        // Non-blocking toast (prevents focus stealing spam)
+                        const toast = document.createElement("div");
+                        toast.innerText = `🚫 MAX SIZE: Only ${MAX_MICROS} micros allowed!`;
+                        toast.style.cssText = "position:fixed;top:10%;left:50%;transform:translateX(-50%);background:red;color:white;padding:15px 30px;font-size:20px;font-weight:bold;z-index:999999;border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,0.5);pointer-events:none;";
+                        document.body.appendChild(toast);
+
                         setTimeout(() => {
+                            if (document.body.contains(toast)) document.body.removeChild(toast);
                             window._sizeAlertActive = false;
                         }, 3000);
                     }
@@ -477,17 +519,9 @@
             updateState({ totalPnL: detectedPnL });
 
             if (state.totalPnL <= -MAX_LOSS) {
-                if (state.testModePnlBypass) {
-                    console.log("DEBUG: P&L Limit hit but Bypassed via Debug Reset");
-                } else {
-                    lock(`💸 MAX DAILY LOSS HIT (-$${Math.abs(state.totalPnL).toFixed(2)})`);
-                }
+                lock(`💸 MAX DAILY LOSS HIT (-$${Math.abs(state.totalPnL).toFixed(2)})`);
             } else if (state.totalPnL >= MAX_WIN) {
-                if (state.testModePnlBypass) {
-                    console.log("DEBUG: Max Win Limit hit but Bypassed via Debug Reset");
-                } else {
-                    lock(`💰 MAX DAILY PROFIT HIT (+$${state.totalPnL.toFixed(2)}) - LOCKING PROFITS`);
-                }
+                lock(`💰 MAX DAILY PROFIT HIT (+$${state.totalPnL.toFixed(2)}) - LOCKING PROFITS`);
             }
         }
     }
@@ -796,14 +830,14 @@
             }
 
             statusDiv.innerHTML = `
-                <div style="color:#00ff00;font-weight:bold;margin-bottom:10px;font-size:16px;">🛡️ RISK MONITOR</div>
+                <div style="color:#00ff00;font-weight:bold;margin-bottom:10px;font-size:16px;">🛡️ DISCIPLINE MONITOR</div>
                 <div style="margin:5px 0;">Trades: ${state.tradeCount}/${MAX_TRADES}</div>
                 <div style="font-size:10px;color:#666;margin:-3px 0 5px 0;">(Source: ${window._lastFillReason || 'NONE'})</div>
                 <div style="font-size:10px;color:#444;margin:-3px 0 5px 0;">(Log Match: ${window._lastTrap || '...'})</div>
                 <div style="margin:5px 0;">Fills Since Lock: ${state.fillsSinceLock}/4</div> <!-- UPDATE 2->4 -->
                 <div style="margin:5px 0;">P&L: <span id="pnl-val" style="color:${state.totalPnL >= 0 ? '#0f0' : '#f00'};font-weight:bold;">$${state.totalPnL.toFixed(2)}</span></div>
                 <div style="font-size:10px;color:#666;margin:-3px 0 5px 0;">(Scanner saw: ${window._lastMatchRaw || '...'})</div>
-                <div style="margin:5px 0;">Max Loss: -$${MAX_LOSS} ${state.testModePnlBypass ? '<span style="color:#ff0">(BYPASSED)</span>' : ''}</div>
+                <div style="margin:5px 0;">Max Loss: -$${MAX_LOSS}</div>
                 <div style="margin:5px 0;">Max Win: +$${MAX_WIN}</div>
                 <div style="font-size:10px;color:#888;margin-top:5px;display:flex;align-items:center;gap:5px;">
                     <div id="scan-dot" style="width:6px;height:6px;background:#0f0;border-radius:50%;opacity:0;"></div>
@@ -812,7 +846,6 @@
                 <div style="margin:5px 0;">Next Check-in: ${checkinMsg}</div>
                 <div style="margin:5px 0;">Contract: ${state.dailyContractSigned ? '✅' : '❌'}</div>
                 ${TEST_ALLOW_MINIS ? '<div style="color:#ff0;font-size:11px;">⚠️ MINIS ALLOWED (TEST)</div>' : ''}
-                ${state.testModePnlBypass ? '<button id="enableRulesBtn" style="margin-top:10px;width:100%;padding:8px;background:#4CAF50;color:white;border:none;border-radius:4px;cursor:pointer;font-weight:bold;">🛡️ RE-ENABLE ALL RULES</button>' : ''}
                 <div style="display:flex;gap:5px;margin-top:10px;">
                     <button id="dumpLogsBtn" style="flex:1;padding:6px;background:#555;color:white;border:none;border-radius:4px;cursor:pointer;font-size:10px;">LOG SCANNER</button>
                     <button id="copyTextBtn" style="flex:1;padding:6px;background:#555;color:white;border:none;border-radius:4px;cursor:pointer;font-size:10px;">COPY PAGE TEXT</button>
@@ -822,7 +855,6 @@
                     <button id="showIDsBtn" style="flex:1;padding:6px;background:#555;color:white;border:none;border-radius:4px;cursor:pointer;font-size:10px;">SHOW IDs</button>
                 </div>
 
-                <button id="debugPassBtn" style="margin-top:5px;width:100%;padding:6px;background:#2196F3;color:white;border:none;border-radius:4px;cursor:pointer;font-size:10px;font-weight:bold;${state.freePasses <= 0 ? 'opacity:0.5;cursor:not-allowed;' : ''}">🐞 USE DEBUG PASS (${state.freePasses} LEFT)</button>
                 <div style="margin-top:10px;color:#ffff00;font-size:12px;">Press == for emergency lock</div>
                 ${TEST_MODE_TRADOVATE ? '<div style="margin-top:8px;color:#ff5722;font-weight:bold;">🧪 TEST MODE ACTIVE</div>' : ''}
             `;
@@ -835,13 +867,7 @@
             // Sync local state with storage in case detectPnL updated it
             state = GM_getValue("STATE", state);
 
-            const enableBtn = document.getElementById("enableRulesBtn");
-            if (enableBtn) {
-                enableBtn.onclick = () => {
-                    updateState({ testModePnlBypass: false });
-                    location.reload();
-                };
-            }
+
 
             const dumpBtn = document.getElementById("dumpLogsBtn");
             if (dumpBtn) {
@@ -889,27 +915,7 @@
 
 
 
-            const debugPassBtn = document.getElementById("debugPassBtn");
-            if (debugPassBtn) {
-                debugPassBtn.onclick = () => {
-                    if (state.freePasses <= 0) {
-                        alert("❌ No debug passes remaining for today!");
-                        return;
-                    }
-                    const password = prompt(`🐞 USE DEBUG PASS?\n\nRemaining: ${state.freePasses}\n\nType "DEBUG" to bypass the lock and rules.\n\n(Time locks cleared, trades kept, risk checks paused)`);
-                    if (password && password.trim() === "DEBUG") {
-                        updateState({
-                            freePasses: state.freePasses - 1,
-                            lockedUntil: null,
-                            testModePnlBypass: true
-                        });
-                        alert(`✅ Pass used! ${state.freePasses} remaining. Reloading...`);
-                        location.reload();
-                    } else {
-                        alert("❌ Incorrect password! Debug pass not used.");
-                    }
-                };
-            }
+
         }
 
         updateStatus();
